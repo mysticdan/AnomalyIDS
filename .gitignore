@@ -1,4 +1,10 @@
-/.venv_pytorch
+/.venv-pytorch
 /02-14-2018.csv
 /02-14-2018.csv.zip
 /dataset
+feature_selection_experiment/BAB_III_METODOLOGI_PENELITIAN.md
+feature_selection_experiment/BAB_III_METODOLOGI_PENELITIAN_SKRIPSI.md
+feature_selection_experiment/artifacts_10Features_64_MAX/
+feature_selection_experiment/artifacts_10Features_64_MEAN/
+feature_selection_experiment/update_notebook.py
+feature_selection_experiment/update_notebook_final.py

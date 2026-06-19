@@ -16,16 +16,23 @@ The dataset consists of multiple CSV files, each representing a day of network t
 ---
 
 ## 3. Feature Selection Methodology
-To find the optimal subset of features, three different paradigms of feature selection are compared:
+To find the optimal subset of features, four different paradigms of feature selection are compared:
 
 | Method | Type | Description |
 | :--- | :--- | :--- |
 | **Mutual Information (MI)** | Filter | Measures the statistical dependence between each feature and the target label. |
 | **Random Forest Importance** | Embedded | Uses the Gini importance/mean decrease in impurity from a Random Forest model. |
 | **Recursive Feature Elimination (RFE)** | Wrapper | Recursively removes the least important features using a Random Forest estimator. |
+| **mRMR** | Filter | Selects features with high relevance to the target and low redundancy with already selected features. |
 
 ### Feature Selection Strategy for Large Data
-Because loading 16M+ rows into memory for feature selection is computationally prohibitive, the project uses a **Representatively Sampled Subset**. A large, balanced sample of Benign and Attack data is drawn across all files to identify features that best distinguish normal traffic from intrusions.
+Because loading 16M+ rows into memory for feature selection is computationally prohibitive, the project uses a **Bounded Streaming Sample**. A balanced Benign/Attack sample is collected incrementally from CSV chunks, so feature selection never requires a full-file or full-dataset load in RAM.
+
+To keep the schema consistent across all days, the pipeline uses only the **80 columns shared by every CSV file**. Extra columns that appear only in `Thuesday-20-02-2018` (such as flow/IP identifier fields) are excluded from feature selection, training, and evaluation.
+
+Before running MI, RF Importance, RFE, and mRMR, the project performs **Correlation Pruning** on the bounded labeled sample. If two features have absolute Pearson correlation above `0.9`, one of them is removed. The drop decision keeps the feature with higher Mutual Information (MI) to the label; if MI is tied, the feature with higher variance is kept.
+
+For the most expensive selector, **RFE**, the project uses a smaller balanced subset than MI/RF. This keeps wrapper-based selection feasible on limited-memory hardware while preserving the full dataset for final training and evaluation.
 
 ---
 
@@ -33,9 +40,14 @@ Because loading 16M+ rows into memory for feature selection is computationally p
 Due to the massive size of the dataset, the project implements a **Streaming/Iterative Architecture**:
 
 ### 4.1 Memory Efficiency
-- **Iterative Loading**: Data is processed file-by-file. No global concatenation of the entire dataset occurs in RAM.
-- **Type Downcasting**: Numeric columns are converted from `float64` to `float32` immediately upon loading, reducing RAM usage by 50%.
-- **Efficient Estimators**: `HistGradientBoostingClassifier` is used for importance calculations as it is significantly faster and more memory-efficient than standard Random Forests for millions of rows.
+- **True Chunked Streaming**: To prevent OOM on 16M+ rows, the project uses a PyArrow-based streaming pipeline that reads data in small row-groups from disk, avoiding loading full files into RAM.
+- **Disk-Backed Evaluation**: Evaluation metrics (ROC-AUC, PR-AUC) are computed using memory-mapped files (`np.memmap`), allowing the analysis of millions of samples without exhausting system memory.
+- **Incremental Thresholding**: The anomaly threshold is calculated as a running maximum during training, reducing memory complexity from $O(N)$ to $O(1)$.
+- **Chunked Preprocessing**: Raw CSVs are converted to Parquet using chunked reading and append-only Parquet writes, so intermediate chunks are never accumulated into a full-file DataFrame.
+- **Streaming Feature Scaling**: `StandardScaler` is fit incrementally over streamed training batches instead of loading a full training file into memory.
+- **Drop-Row Cleaning**: Missing or invalid numeric rows are removed after numeric coercion and `inf/-inf` cleanup. The pipeline does not impute missing traffic values with synthetic replacements.
+- **Type Downcasting**: Numeric feature columns are normalized to `float32` before sampling, Parquet writing, and model input, which keeps memory usage predictable and avoids schema drift across chunks.
+- **Bounded Feature Selection**: Correlation pruning and MI/RF/mRMR operate on a bounded sampled matrix, while RFE uses an even smaller balanced subset and lighter estimator settings to remain feasible on low-RAM machines.
 
 ### 4.2 Temporal Split Logic (No Shuffle)
 To preserve the time-series nature of the traffic for the LSTM, a **Sequential/Temporal Split** is applied per file:
@@ -70,6 +82,7 @@ The model is a **Sequence-to-Sequence LSTM-Autoencoder**.
 - **Dropout**: 0.2
 - **Batch Size**: 64
 - **Epochs**: 30
+- **Selected Features per Method**: 15
 - **Loss Function**: Mean Absolute Error (`nn.L1Loss`)
 - **Optimizer**: Adam
 
@@ -80,12 +93,13 @@ The model is a **Sequence-to-Sequence LSTM-Autoencoder**.
 ### 6.1 Training Phase
 - **Data**: Only $\text{Benign}_{\text{train}}$ is used.
 - **Process**: The model is updated iteratively using data from each file.
-- **Thresholding**: After training, the reconstruction error for the training set is calculated. The anomaly threshold is set as the **maximum reconstruction error** found in the training data:
-  $$\text{Threshold} = \max(\text{Train Reconstruction Errors})$$
+- **Thresholding**: After training, the **MAE reconstruction error** for the training set is calculated. The anomaly threshold is set as the **90th percentile of the training MAE distribution**:
+  $$\text{Threshold} = P_{90}(\text{Train MAE Reconstruction Errors})$$
+- **Artifact Persistence**: Each feature-selection method saves its trained model, fitted scaler, and metadata under `artifacts/<method>/` for reuse.
 
 ### 6.2 Evaluation Phase
 - **Data**: $\text{Benign}_{\text{test}} + \text{All Attacks}$.
-- **Detection**: If $\text{Reconstruction Error} > \text{Threshold}$, the sample is flagged as an **Anomaly**.
+- **Detection**: If the test **MAE reconstruction error** exceeds the threshold, the sample is flagged as an **Anomaly**.
 - **Metrics**:
     - Accuracy
     - Precision, Recall, F1-Score (Normal vs Attack)
@@ -95,9 +109,10 @@ The model is a **Sequence-to-Sequence LSTM-Autoencoder**.
 ---
 
 ## 7. Summary of Workflow
-1.  **Sample** $\rightarrow$ **Feature Selection** (MI vs RF vs RFE) $\rightarrow$ **3 Feature Sets**.
+1.  **Bounded Streaming Sample** $\rightarrow$ **Correlation Pruning** $\rightarrow$ **Feature Selection** (MI vs RF vs RFE vs mRMR) $\rightarrow$ **4 Feature Sets**.
 2.  For each Feature Set:
     - **Iterative Load** $\rightarrow$ **Temporal Split** $\rightarrow$ **Train LSTM-AE on Benign**.
-    - **Calculate Max Train Error** $\rightarrow$ **Set Threshold**.
+    - **Calculate Train MAE Distribution** $\rightarrow$ **Set P90 Threshold**.
+    - **Save Model + Scaler + Metadata**.
     - **Iterative Load** $\rightarrow$ **Test on Benign/Attack** $\rightarrow$ **Compute Metrics**.
 3.  **Compare** results to determine the best feature selection method.
